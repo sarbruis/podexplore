@@ -1,7 +1,7 @@
 # podexplore
 Podcast recommendations using Latent Semantic Analysis/Indexing (LSA/LSI).  
 
-The results of this code are used on [podexplore.com](http://podexplore.com) to suggest similar podcasts.
+The results of this code are used on [podexplore.com](http://www.podexplore.com) to suggest similar podcasts.
 
 There are two R markdown files here.  One is **podcast_data_scraper** and one is **podcast_data_modeler**.
 
