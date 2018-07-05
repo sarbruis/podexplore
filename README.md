@@ -1,5 +1,5 @@
 # podexplore
-Podcast recommendations using Latent Semantic Analysis/Indexing (LSA/LSI).  
+Podcast recommendations using Latent Semantic Analysis/Indexing (LSA/LSI) of podcast descriptions.  
 
 The results of this code are used on [podexplore.com](http://www.podexplore.com) to suggest similar podcasts.
 
