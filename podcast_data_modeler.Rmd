@@ -1,0 +1,409 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(jsonlite)
+library(stopwords)
+library(qdapRegex)
+library(quanteda)
+library(topicmodels)
+library(coop)
+library(irlba)
+library(knitr)
+library(textcat)
+library(stringi)
+library(magrittr)
+#library(bigmemory)
+```
+
+##Data cleaning + processing
+
+Let's create some function for text cleaning.  We'll remove any HTML tags.  Then we'll remove a bunch of other non-word characters and stop words.
+
+```{r}
+
+stopwords_en <- stopwords("en")
+podcast_networks <- unlist(read_csv("podcast_networks.txt", col_names = FALSE))
+top5000words <- read_csv("top5000words.csv", col_names = TRUE)
+
+#let's take the words out of the top 5000 that aren't nouns, verbs, adjectives
+useless_words <- top5000words %>% filter(!(`Part of speech` %in% c('n', 'v', 'j'))) %>% select(`   Word`)
+names(useless_words) <- c("word")
+
+more_words <- 
+  c("podcast", "podcasts", "show", "shows", "week", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday", "weekly", "daily", "weekday", "awardwinning", "awards", "award" , "today", "todays", "thousands", "millions", "around", "also", "biweekly", "winning", "winner", "best", "stitcher", "distributed", "produced", "updated", "updates", "itunes", "iheart", "soundcloud", "behind", "stories behind", "fans", "fan")
+
+phrases <- c("wnyc studios is the producer", "from wondery, the network behind", "offer code", "stitcher premium", "free month", "itunes", "iheart", "soundcloud", "twitter", "a proud member of radiotopia", "learn more at", "please visit", "email us", "subscribe to us", "use the code", "show notes", "like us on", "review us on", "subscribe at", "brought to you by", "check us out", "leave a review", "find us at", "top\\s[0-9]{1,3}\\s", "e-mail questions", "email questions", "new episodes", "new episode", "airs live on", "support us", "patreon", "full archives are available at")
+
+stopwords <- c(more_words, unname(podcast_networks), unlist(useless_words), stopwords_en ) %>%
+  str_to_lower() %>%
+  unique()
+
+stopwords <- gsub("[[:punct:]]", "", stopwords) #remove punctuation from stopwords
+
+#function to remove a lot of stuff we don't want to from the description text
+clean_description <- function(text) {
+  
+  text <- str_to_lower(text)
+
+  #convert to html
+  html <- tryCatch({
+             read_html(text)}, error = function(e) text)
+  
+  #take out the body text (ie, remove html tags)
+  text <- tryCatch({
+             html_text(html)}, error = function(e) text)
+  
+  text <- gsub("\\r", " ", text) #remove all \r
+  text <- gsub("\\t", " ", text) #remove all \t
+  text <- gsub("\\n", " ", text) #remove all newlines
+  text <- gsub("\\s+"," ", text) #collapse spaces to one space
+  
+  #split on sentence breaks, keep the last letter
+  text <- str_split(text, "(?<=[a-z])\\. ")
+
+  text <- tryCatch({
+            text[[1]][!mapply(grepl, paste(phrases, collapse="|"), text)[,1]]}, error = function(e) text)
+  
+  text <- paste(text, collapse = " ")
+  
+  text <- gsub("\\S+[.]\\S+", "", text) #remove words that contain a dot (eg, urls, email addresses)
+  text <- gsub("\\S+[@]\\S+", "", text) #remove words that contain an @
+  text <- gsub("[[:punct:]]", "", text) #remove all punctuation
+  text <- gsub("[0-9]", "", text) #remove all numbers
+  text <- gsub("\\W", " ", text) #remove all non-words
+  
+  #remove stopwords
+  text <- gsub(paste0('\\b', paste(stopwords, collapse='\\b|\\b')), " ", text)
+  text <- gsub("\\s+"," ", text) #collapse spaces to one space
+
+  text <- str_split(text, " ")[[1]]
+  text <- text[text != ""] #non-words
+
+  text
+}
+
+clean_description_minimal <- function(text) {
+  
+  #convert to html
+  text = tryCatch({
+             read_html(text)}, error = function(e) text)
+  
+  #take out the body text (ie, remove html tags)
+  text = tryCatch({
+             html_text(text)}, error = function(e) text)
+  
+  text <- gsub("\\r", " ", text) #remove all \r
+  text <- gsub("\\t", " ", text) #remove all \t
+  text <- gsub("\\n", " ", text) #remove all newlines
+
+  text
+}
+
+```
+
+Now we'll use the quanteda package to create a corpus and trim it a bit, removing entries with non-english descriptions or missing descriptions.  Then cleaning the descriptions by removing HTML tags and punctuation and trimming the descriptions by removing unimportant words.
+
+```{r}
+
+# data_set1 <- data_full
+# 
+# data_full <- bind_rows(data_full, more_data)
+
+data_quanteda <- data_full
+
+#remove any title duplicates
+data_quanteda <- data_quanteda[!duplicated(paste(data_quanteda$collectionName, data_quanteda$artistName)),]
+
+#remove any episode descriptions in the podcast descriptions
+episode_starts <- c("in this", "in this", "on this", "on today's", "in today's")
+
+data_quanteda$summary[grepl(paste(episode_starts, collapse="|"), word(str_to_lower(data_quanteda$summary), 1, 3)) &
+                  grepl("\\bepisode\\b", str_to_lower(data_quanteda$summary)) &
+                  !grepl("\\bthis\\spodcast\\b", str_to_lower(data_quanteda$summary))] <- " "
+
+data_quanteda$description[grepl(paste(episode_starts, collapse="|"), word(str_to_lower(data_quanteda$description), 1, 3)) &
+                  grepl("\\bepisode\\b", str_to_lower(data_quanteda$description)) &
+                  !grepl("\\bthis\\spodcast\\b", str_to_lower(data_quanteda$description))] <- " "
+
+#these are cases where there are timestamps, which indicates an episode description (so remove them)
+data_quanteda[str_count(data_quanteda$summary, "[0-9]:[0-9]") > 3 & !is.na(data_quanteda$summary), ]$summary <- " "
+
+#take out summaries with a lot of ellipses, which usually indicate a rambling non-podcast description or an episode description
+data_quanteda[str_count(data_quanteda$summary, "\\.\\.\\.") > 4 & !is.na(data_quanteda$summary), ]$summary <- " "
+
+#take out summaries that mention a "this episode", a sure sign that this is an episode description
+data_quanteda[str_count(data_quanteda$summary, "this episode") >= 1 & !is.na(data_quanteda$summary), ]$summary <- " "
+
+#take only the info that we need and remove podcasts with descriptions longer than one word
+data_quanteda <- data_quanteda %>%
+  select(collectionId, summary, description, keywords, collectionName, genreIds, artworkUrl100, collectionViewUrl) %>%
+  mutate(summary_length = map(str_split(summary, " "), length)) %>%
+  mutate(description_length = map(str_split(description, " "), length)) %>%
+  mutate(description = ifelse(unlist(description_length) >= unlist(summary_length), description, summary)) %>%
+  select(-summary) %>%
+  filter(description_length > 1) %>%
+  as_tibble()
+
+data_quanteda$original_description <- data_quanteda$description
+
+data_quanteda$description_language_textcat <- map(data_quanteda$description, textcat)
+
+#this convoluted call dives into the lists and extracts the highest-confidence language for each description
+data_quanteda$description_language_stringi <- 
+  unlist(map(map(map(map(data_quanteda$description, stri_enc_detect), `[[`, 1), `[[`, 2), `[[`, 1))
+
+#this convoluted call dives into the lists and extracts the highest confidence
+data_quanteda$description_language_conf_stringi <- 
+  unlist(map(map(map(map(data_quanteda$description, stri_enc_detect), `[[`, 1), `[[`, 3), `[[`, 1))
+
+#remove rows where textcat or stringi show NA for language (this usually means no description given)
+data_quanteda <- data_quanteda %>%
+  filter(is.na(description_language_textcat) == FALSE) %>%
+  filter(is.na(description_language_stringi) == FALSE)
+
+a <- data_quanteda[data_quanteda$description_language_stringi == "",]
+
+#if there's no high-confidence language, look at the second-highest confidence and its language
+data_quanteda[data_quanteda$description_language_stringi == "",]$description_language_conf_stringi <- 
+a <- data_quanteda[data_quanteda$description_language_stringi == "",] %>%
+  mutate(description_language_conf_stringi = unlist(map(map(map(map(description, stri_enc_detect), `[[`, 1), `[[`, 3), `[[`, 2))) %>%
+  select(description_language_conf_stringi) %>%
+  unlist()
+
+data_quanteda[data_quanteda$description_language_stringi == "",]$description_language_stringi <- 
+  data_quanteda[data_quanteda$description_language_stringi == "",] %>%
+  mutate(description_language_stringi = 
+           unlist(map(map(map(map(description, stri_enc_detect), `[[`, 1), `[[`, 2), `[[`, 2))) %>%
+  select(description_language_stringi) %>%
+  as_tibble() %>%
+  unlist()
+
+#these have no language guess from stringi, which means they're almost definitely non-english
+data_quanteda <- data_quanteda %>%
+  filter(!(description_language_stringi %in% c("")))
+
+data_quanteda <- data_quanteda %>%
+  filter(description_language_textcat %in% c("english", "scots", "breton", "catalan")) %>%
+  filter(description_language_stringi %in% c("en"))
+
+#add in keywords
+keywords <- map(data_quanteda$keywords, paste, collapse = ' ')
+keywords <- gsub("NA", "", keywords)
+
+#concatenate keywords to the end of the description
+data_quanteda$description <- paste(data_quanteda$description, keywords) 
+
+genre_ids <- read_csv("genre_ids.csv", col_names = FALSE)
+names(genre_ids) <- c("ID", "genre_name")
+
+data_genres <- data_quanteda$genreIds
+
+#replace genreIDs with the corresponding text and collapse to be concatenated to the end of the description
+for (i in 1:length(data_genres)) {
+  data_genres[i] <- paste(genre_ids[genre_ids$ID %in% data_genres[[i]],]$genre_name, collapse = " ")
+}
+
+data_quanteda$description <- paste(data_quanteda$description, data_genres)
+
+#send every description to the clean_description function
+data_quanteda <- data_quanteda %>%
+  mutate(description_words = map(description, clean_description))
+
+#Now we can build up a corpus that we can use to determine word frequencies to make our recommendations. We can also use this corpus to determine which words only occur once and hence will be useless for the recommendations (so we remove those).
+corpus_full <- unlist(data_quanteda$description_words)
+corpus <- corpus_full[duplicated(corpus_full)] #remove unique words
+corpus <- unique(corpus) #remove duplicates
+
+#remove all words in the description lists that are not in the corpus
+for (i in 1:length(data_quanteda$description_words)) {
+  
+  d <- data_quanteda[i,]$description_words[[1]]
+  d <- d[d %in% corpus]
+  data_quanteda[i,]$description_words[[1]] <- d
+}
+
+data_quanteda$description <- map(data_quanteda$description_words, paste, collapse = " ")
+
+#write(unlist(data_quanteda$description), "descriptions.txt")
+```
+
+
+Now we're going to start working with the quanteda package to make a corpus and document term frequency matrix (DFM) that we can use to analyze description similarities.
+
+```{r}
+corpus_quanteda <- corpus(as.character(data_quanteda$description))
+docvars(corpus_quanteda, "collectionId") <- data_quanteda$collectionId
+docvars(corpus_quanteda, "collectionName") <- data_quanteda$collectionName
+
+corpus_dfm <- dfm(corpus_quanteda, remove = stopwords("english"), stem = TRUE, remove_punct = TRUE, tolower = TRUE) %>% 
+  dfm_trim(min_termfreq = 4, min_docfreq = 4)
+
+#remove single-letter features
+corpus_dfm <- dfm_select(corpus_dfm, min_nchar = 2)
+
+#write(names(topfeatures(corpus_dfm, 10000)), "topfeatures.txt")
+```
+
+Now let's use TF-IDF to weight the features and then look at cosine distance to determine similarities between descriptions
+
+```{r}
+
+#weight the dfm by tf-idf
+corpus_dfm_tfidf <- dfm_tfidf(corpus_dfm, scheme_tf = "prop")
+
+```
+
+Calculate cosine distance using only the TF-IDF DFM
+```{r eval=FALSE}
+
+#use this to get the text number for a given collectionId
+#you need to find some way to create a dataframe with both
+podcast_text <- names(corpus_subset(corpus_quanteda, collectionId == "913805339")[1])
+
+#we can use cosine similarity to calculate a similarity score for each podcast
+simil <- textstat_simil(corpus_dfm_tfidf, podcast_text, margin = "documents")
+similarity_scores <- unname(lapply(as.list(simil), head, 20)[[1]])
+similar_podcasts_names <- names(lapply(as.list(simil), head, 20)[[1]])
+corpus_similar <- corpus_quanteda[[similar_podcasts_names,]]
+corpus_similar$similarity_score <- similarity_scores
+
+```
+
+To improve on this, let's try latent semantic indexing/analysis (LSI aka LSA) which will reduce the dimentionality of our DFM.  We can then use cosine distance to determine similarity.
+
+```{r}
+
+#let's try to find out how many dimensions to use for LSA by looking at variance explained with the dimensions
+#this takes about 20 min to run
+# system.time({dec <- RSpectra::svds(corpus_dfm_tfidf, k = 5000, nu = 5000, nv = 0)})
+# singular_values <- dec$d
+# squared_singular_values <- singular_values^2
+# var_explained <- as_tibble(squared_singular_values / sum(squared_singular_values))
+
+#if we look at total var explained, we can use a cutoff like 50 or 70% to choose how many dimensions to use
+# var_explained$cumsum <- cumsum(var_explained$value)
+# dimensions <- which(var_explained$cumsum > 0.7)[1]
+# dimensions
+
+dimensions <- 220
+
+#create an LSA textmodel
+lsa_model <- textmodel_lsa(corpus_dfm, nd = dimensions, margin = "features")
+
+#this is the reduced-dimension space
+lr_matrix <- t(lsa_model$matrix_low_rank)
+
+#calculate cosine similarities between every feature
+cosines <- cosine(lr_matrix)
+
+```
+
+Printing the list of podcasts + collectionIds as a JSON file
+
+```{r}
+
+data_json <- data_quanteda %>%
+  select(collectionId, collectionName, original_description, artworkUrl100, collectionViewUrl) %>%
+  mutate(original_description = as.character(map(original_description, clean_description_minimal)))
+
+names(data_json) <- c("ID", "label", "description", "artworkUrl", "itunesUrl")
+
+write(toJSON(data_json, pretty = TRUE), "podcasts.json")
+
+```
+
+Printing the similar podcasts lists as a JSON file.  Make sure an updated cosines matrix has been calculated before running.
+
+```{r}
+
+list_of_similars <- vector(mode="list", length=0)
+
+for(i in 1:length(data_json$ID)) {
+
+  podcast_num <- i
+  
+  similar_pods <- bind_cols(as_tibble(cosines[i,]), as_tibble(names(cosines[i,]))) %>% 
+    arrange(desc(value)) %>%
+    slice(1:1000)
+  
+  #extract the genre from our big data_quanteda table and then remove any podcasts that don't match the primary genre
+  similar_pods_info <- corpus_quanteda[[similar_pods$value1,]] %>%
+    left_join(data_quanteda, by = "collectionId") %>%
+    select(texts, collectionId, collectionName.x, genreIds) %>%
+    mutate(score = similar_pods$value) 
+  
+  genres <- similar_pods_info$genreIds[[1]]
+  
+  similar_pods_info <- similar_pods_info  %>%
+    mutate(intersection = map(map(genreIds, intersect, genres), length)) %>%
+    filter(intersection > 1) %>%
+    slice(1:25)
+  
+  info_pairs <- mapply(c, as.list(similar_pods_info$collectionId), as.list(similar_pods_info$score), SIMPLIFY = FALSE)
+  
+  list_of_similars <- append(list_of_similars, list(info_pairs))
+}
+
+names(list_of_similars) <- data_json$ID
+
+write(toJSON(list_of_similars, pretty = TRUE), "similar_podcasts.json")
+```
+
+To-do:
+*try taking out adjectives
+*maybe just look for inclusion in the genres list instead of just looking at the top one
+*get podcast URLs?
+*remove video duplicates of audio podcasts (audio) v. (video)
+*scrape info from each podcast's itunes page.  remove podcasts without any ratings.  track number of ratings.  should number of ratings feed into the algorithm somehow?  also include a "latest podcast release date" field (for which you'll have to re-acquire the json data (and do a join to the data frame).
+
+
+
+
+To get similar podcasts for one particular podcast
+
+```{r eval=FALSE}
+
+#get text from podcast collectionId and remove the "text" prefix
+podcast_num <- as.numeric(substring(names(corpus_subset(corpus_quanteda, collectionId == "941907967")[1]), 5))
+
+similars <- bind_cols(as_tibble(cosines[podcast_num,]), as_tibble(names(cosines[podcast_num,]))) %>% 
+  arrange(desc(value))
+similar_pods <- head(similars$value1, 100)
+similar_pods_info <- corpus_quanteda[[similar_pods,]]
+similar_pods_info$similarity_score <- head(similars$value, 100)
+
+```
+
+This section is for cleaning up and printing the similar podcasts list using the kable() function.
+
+```{r eval=FALSE}
+
+for (i in 1:length(similar_pods_info$texts)) {
+  
+  d = similar_pods_info[i,]$texts[[1]]
+  
+  #convert to html
+  d = tryCatch({
+             read_html(d)}, error = function(e) d)
+  
+  #take out the body text
+  d = tryCatch({
+             html_text(d)}, error = function(e) d)
+  
+  similar_pods_info[i,]$texts = d
+}
+
+similar_pods_info <- similar_pods_info %>%
+  mutate(texts = map(texts, clean_description_minimal))
+
+kable(similar_pods_info)
+
+#add keywords.  take out ones with description lengths < 5.  make a corpus of the keywords and get more podcasts for the top 100 or so.  split the data gathering section from the analysis section
+
+#NOTE: to find collectionId, look at data_quanteda
+
+```

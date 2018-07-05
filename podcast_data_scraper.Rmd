@@ -1,0 +1,193 @@
+---
+title: "Podcast Data Scraper"
+output:
+  html_notebook: default
+  html_document: default
+  pdf_document: default
+date: "May 31, 2018 - Present"
+---
+
+```{r}
+library(tidyverse)
+library(httr)
+library(jsonlite)
+library(rvest)
+library(stopwords)
+library(qdapRegex)
+library(quanteda)
+library(topicmodels)
+library(coop)
+library(irlba)
+library(knitr)
+```
+
+##Getting podcast data from iTunes and RSS feeds 
+
+Let's start by making a list of all the podcast (sub-)genre IDs and then creating URLs out of them. We want all possible top podcasts in each genre, so we'll set the limit to 200 results, which is the most we can get. 
+```{r}
+
+genre_ids <- c(
+"1301", "1306", "1401", "1402", "1405", "1406", "1459", "1303", "1304", "1415", "1416", "1468",
+"1469", "1470", "1305", "1307", "1417", "1420", "1421", "1481", "1309", "1310", "1311", "1314", 
+"1438", "1439", "1440", "1441", "1444", "1463", "1464", "1315", "1477", "1478", "1479", "1316", 
+"1456", "1465", "1466", "1467", "1318", "1446", "1448", "1450", "1480", "1321", "1410", "1412", 
+"1413", "1471", "1472", "1323", "1404", "1454", "1455", "1460", "1461", "1324", "1302")
+
+urls <- paste0("https://itunes.apple.com/search?term=podcast&genreId=", genre_ids, "&limit=200")
+```
+
+Next we're going to use the iTunes Search API to get data for each subgenre using the GET method from httr.  For each URL, being one genre, we make an API request and then convert the result to JSON and add it to a list.  The list is collapsed at the end.  The API has a maximum rate of 20 requests per minute, so we wait 4 seconds after each request to ensure that we don't exceed the maximum request rate.
+```{r, eval = FALSE}
+
+get_json_list_from_urls <- function(urls_list, selection_names) {
+  
+  json_list = list()
+  
+  for (i in 1:length(urls_list)) {
+    
+    print(paste("Getting JSON data for", i))
+    
+    json <- tryCatch({
+      content(GET(urls_list[i]), "raw") %>%
+      rawToChar() %>%
+      fromJSON()},
+      error = function(e) NA)
+  
+    if (sum(is.na(json)) == FALSE & json$resultCount > 0 & all(info %in% names(json$results))) {
+    
+      json <- json$results %>%
+        as.tibble() %>%
+        select(selection_names)
+    
+      json_list[[i]] <- json
+    }
+    
+    Sys.sleep(4)
+  }
+  
+  json_list
+}
+```
+
+```{r}
+info <- c("collectionId", "artistName", "collectionName", "collectionViewUrl", "feedUrl", 
+  "artworkUrl100", "trackCount", "country", "primaryGenreName", "genreIds", "releaseDate")
+
+list_of_json <- get_json_list_from_urls(urls, info)
+
+#bind all rows and remove duplicates
+data <- bind_rows(list_of_json) %>%
+  subset(!duplicated(.[c("collectionId")]))
+```
+
+Now we're going to look up each podcast's RSS feed and grab its description and list of keywords, if available.
+```{r, eval = FALSE}
+
+scrape_rss <- function(rss_urls) {
+
+  summaries_list = list()
+  descriptions_list = list()
+  keywords_list = list()
+  
+  for (i in 1:length(rss_urls)) {
+    
+    print(paste("Getting RSS data for", i))
+
+    xml <- try(read_xml(rss_urls[i]), silent = TRUE)
+    
+    summary <- tryCatch({xml %>%
+      xml_nodes("itunes\\:summary") %>%
+      xml_text() %>%
+      first()}, 
+      error = function(e) NA, 
+      warning = function(e) NA)
+    
+    description <- tryCatch({xml %>%
+      xml_nodes("description") %>%
+      xml_text() %>%
+      first()}, 
+      error = function(e) NA, 
+      warning = function(e) NA)
+    
+    keywords <- tryCatch({xml %>%
+      xml_nodes("itunes\\:keywords") %>%
+      xml_text() %>%
+      first() %>%
+      str_split(",") %>%
+      first() %>%
+      str_trim()}, 
+      error = function(e) NA, 
+      warning = function(e) NA)
+    
+      summaries_list[[i]] = summary
+      descriptions_list[[i]] = description
+      keywords_list[[i]] = keywords
+  }
+
+  list(summaries_list, descriptions_list, keywords_list)
+}
+```
+
+```{r}
+info_list <- scrape_rss(data$feedUrl)
+
+data <- add_column(data, summary = info_list[[1]])
+data <- add_column(data, description = info_list[[2]])
+data <- add_column(data, keywords = info_list[[3]])
+```
+
+Now let's use these keywords to fetch more podcasts.  First, let's take all the keywords, remove duplicates, then take only the first word of the keyword to make the list a little smaller.  We'll use these keywords as search terms.
+
+```{r eval=FALSE}
+
+#arrange keywords by frequency + remove those with low frequency
+keyword_freq <- table(unlist(keywords_list))
+keyword_freq <- as_tibble(cbind.data.frame(word = names(keyword_freq), freq = as.integer(keyword_freq))) %>%
+  arrange(desc(freq)) %>%
+  filter(freq > 2)
+
+#take only the words and remove the first entry (" ")
+keywords_vector <- keyword_freq[3:length(keyword_freq$word),]$word
+
+#take only the first word if there are multiple
+first_words <- keywords_vector %>%
+  str_split(" ") %>% 
+  map(first) %>%
+  unlist() %>%
+  str_to_lower() %>%
+  unique() %>%
+  subset(!(. %in% stopwords("en")))
+
+#write(first_words, "keywords.txt")
+
+keywords <- read_csv("keywords_set1.txt", col_names = FALSE)$X1
+
+more_urls = paste0("https://itunes.apple.com/search?entity=podcast&term=", keywords, "&limit=20")
+```
+
+Now let's make the API requests as before and then scrape the RSS feeds to get the summary, description, and keywords.
+
+```{r, eval = FALSE}
+more_urls_set1 = more_urls
+
+more_list_of_json <- get_json_list_from_urls(more_urls_set1, info)
+
+#bind all rows and remove duplicates
+more_data <- bind_rows(more_list_of_json) %>%
+  subset(!duplicated(.[c("collectionId")]))
+
+#remove entries/podcasts that are already in our data set
+more_data <- more_data %>%
+  subset(!(more_data$collectionId %in% data$collectionId))
+
+#scrape data from the rss feeds
+info_list <- scrape_rss(more_data$feedUrl)
+
+more_data_backup <- more_data
+
+more_data <- add_column(more_data, summary = info_list[[1]])
+more_data <- add_column(more_data, description = info_list[[2]])
+more_data <- add_column(more_data, keywords = info_list[[3]])
+
+```
+
